@@ -7,3 +7,5 @@ api/config.php
 api/sessions/
 .DS_Store
 *.log
+AGENTS.md
+DEPLOYMENT.md
