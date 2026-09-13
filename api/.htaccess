@@ -1,0 +1,30 @@
+# Apache configuration for PHP backend
+# Ensure mod_rewrite is enabled on your server
+
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  
+  # Redirect to HTTPS if not already
+  RewriteCond %{HTTPS} off
+  RewriteRule ^(.*)$ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+  
+  # Set proper headers for API responses
+  <FilesMatch "\.php$">
+    Header set Access-Control-Allow-Origin "https://your-frontend-domain.com"
+    Header set Access-Control-Allow-Methods "POST, OPTIONS"
+    Header set Access-Control-Allow-Headers "Content-Type"
+  </FilesMatch>
+  
+  # Handle OPTIONS preflight requests
+  RewriteCond %{REQUEST_METHOD} OPTIONS
+  RewriteRule ^(.*)$ $1 [R=200,L]
+</IfModule>
+
+# Disable directory browsing
+Options -Indexes
+
+# Protect config files
+<FilesMatch "config\.php">
+  Order allow,deny
+  Deny from all
+</FilesMatch>
