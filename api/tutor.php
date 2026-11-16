@@ -20,13 +20,15 @@ header('Content-Type: application/json');
 $fileConfig = is_file(__DIR__ . '/config.php') ? require __DIR__ . '/config.php' : [];
 $apiKey = getenv('GEMINI_API_KEY') ?: ($fileConfig['gemini_api_key'] ?? '');
 $model = getenv('GEMINI_MODEL') ?: ($fileConfig['gemini_model'] ?? '');
-$allowedOrigins = array_filter(array_map('trim', explode(',',
-    getenv('ALLOWED_ORIGINS') ?: ($fileConfig['allowed_origins'] ?? 'http://localhost:5173')
-)));
+// The live frontend and local dev are always allowed; ALLOWED_ORIGINS adds more.
+$defaultOrigins = 'https://ai-tutor-rho-one.vercel.app,http://localhost:5173';
+$allowedOrigins = array_values(array_filter(array_map('normalizeOrigin', explode(',',
+    $defaultOrigins . ',' . (getenv('ALLOWED_ORIGINS') ?: ($fileConfig['allowed_origins'] ?? ''))
+))));
 
 // --- CORS: only our own frontend may call this from a browser ---------------
 
-$origin = $_SERVER['HTTP_ORIGIN'] ?? '';
+$origin = normalizeOrigin($_SERVER['HTTP_ORIGIN'] ?? '');
 if ($origin !== '' && in_array($origin, $allowedOrigins, true)) {
     header("Access-Control-Allow-Origin: $origin");
     header('Vary: Origin');
@@ -148,25 +150,20 @@ $body = [
     ],
 ];
 
-$ch = curl_init("https://generativelanguage.googleapis.com/v1beta/models/" . rawurlencode($model) . ":generateContent");
-curl_setopt_array($ch, [
-    CURLOPT_RETURNTRANSFER => true,
-    CURLOPT_POST => true,
-    // Key in a header, not the URL, so it never ends up in proxy or server logs.
-    CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'x-goog-api-key: ' . $apiKey],
-    CURLOPT_POSTFIELDS => json_encode($body),
-    CURLOPT_TIMEOUT => 25,
-]);
-$response = curl_exec($ch);
-$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-$curlError = curl_error($ch);
-curl_close($ch);
+// Gemini can be slow or briefly overloaded on the free tier, so allow it
+// time to answer and retry once if it fails fast with a server error.
+[$response, $httpCode, $curlError] = callGemini($model, $apiKey, $body, 40);
+if (!$curlError && in_array($httpCode, [500, 502, 503, 504], true)) {
+    error_log("AI Tutor: Gemini HTTP $httpCode, retrying once");
+    sleep(2);
+    [$response, $httpCode, $curlError] = callGemini($model, $apiKey, $body, 40);
+}
 
 if ($curlError) {
     error_log("AI Tutor: Gemini request failed: $curlError");
     jsonError(502, 'Could not reach the AI service. Please try again.');
 }
-if ($httpCode === 429) {
+if ($httpCode === 429 || $httpCode === 503) {
     jsonError(503, 'The AI service is busy right now. Please try again in a minute.');
 }
 
@@ -202,6 +199,30 @@ if (count($clean) === 0 || ($mode === 'passages' && count($clean) !== $minCards)
 echo json_encode(['cards' => $clean]);
 
 // --- Helpers -------------------------------------------------------------------
+
+function callGemini(string $model, string $apiKey, array $body, int $timeout): array {
+    $ch = curl_init('https://generativelanguage.googleapis.com/v1beta/models/' . rawurlencode($model) . ':generateContent');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST => true,
+        // Key in a header, not the URL, so it never ends up in proxy or server logs.
+        CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'x-goog-api-key: ' . $apiKey],
+        CURLOPT_POSTFIELDS => json_encode($body),
+        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_TIMEOUT => $timeout,
+    ]);
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
+    curl_close($ch);
+    return [$response, $httpCode, $curlError];
+}
+
+// "https://Example.com/ " and "'https://example.com'" both become
+// "https://example.com", so small typos in ALLOWED_ORIGINS don't lock the site out.
+function normalizeOrigin($value): string {
+    return strtolower(rtrim(trim((string) $value, " \t\n\r\"'"), '/'));
+}
 
 function jsonError(int $status, string $message): void {
     http_response_code($status);
