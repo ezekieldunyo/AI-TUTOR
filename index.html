@@ -7,6 +7,15 @@
     <title>Adaptive Tutor</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Fraunces:wght@400;500&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+      /* Phones and small tablets: stack the profile sidebar above the cards. */
+      @media (max-width: 760px) {
+        .workspace { flex-direction: column !important; }
+        .workspace-sidebar { width: auto !important; padding: 20px !important; gap: 16px !important; }
+        .workspace-sidebar svg { max-width: 140px !important; }
+        .workspace-main { padding: 20px 16px !important; }
+      }
+    </style>
   </head>
   <body>
     <div id="root"></div>

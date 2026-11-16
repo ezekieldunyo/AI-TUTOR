@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef } from "react";
+import { useState, useMemo, useRef, useEffect } from "react";
 // npm install pdfjs-dist
 // This import path matches pdfjs-dist v4. See README for the one-line worker setup.
 import * as pdfjsLib from "pdfjs-dist";
@@ -75,9 +75,9 @@ function dominantStyle(profile) {
 }
 
 // --- Text chunking -------------------------------------------------------
-// Splits raw text (typed topic or extracted PDF text) into 1-6 concept-sized
-// chunks. This is a simple heuristic for the prototype; swap for a real
-// Claude API call to get genuine per-chunk summarization (see README).
+// Splits extracted PDF text into 1-6 passages of a few sentences each.
+// Each passage becomes one card. (Typed topics skip this: Gemini decides how
+// to break a topic into cards.)
 
 function splitSentences(text) {
   return text
@@ -98,58 +98,46 @@ function chunkText(text, maxCards = 6) {
   return chunks.slice(0, maxCards);
 }
 
-function firstWords(text, n) {
-  return text.split(" ").slice(0, n).join(" ");
+// --- AI generation via the PHP/Gemini backend ------------------------------
+// The Gemini key stays on the server (api/tutor.php). There is deliberately
+// no "fake" local fallback: if the AI request fails, the user sees a real
+// error and a Try again button instead of made-up content.
+
+// Free hosting (Render) sleeps when idle, so the first request after a quiet
+// spell can take 30-60 seconds. Ping it as soon as the app opens so it's
+// usually awake by the time the learning-style quiz is finished.
+function wakeBackend() {
+  fetch(`${API_URL}?ping=1`).catch(() => {});
 }
 
-// --- Card generation -------------------------------------------------------
-// Every card carries the same four elements (visual map, big idea, key
-// pieces, analogy). The learning style decides which element leads, and how
-// the card is laid out, not which elements exist.
-
-function buildCard(chunk, style, index, total) {
-  const sentences = splitSentences(chunk);
-  const bigIdea = sentences[0] || chunk;
-  const keyPieces = sentences.slice(1, 4);
-  const topicSnippet = firstWords(chunk, 6);
-
-  return {
-    index,
-    total,
-    style,
-    bigIdea,
-    visualPoints:
-      keyPieces.length > 0
-        ? keyPieces
-        : [`How ${topicSnippet}... connects to what came before it`],
-    keyPieces: keyPieces.length > 0 ? keyPieces : [bigIdea],
-    analogy: `Think of "${topicSnippet}..." the way you'd think of a single step in a recipe: it only makes sense in relation to the step before and after it.`,
-    example: `Consider how ${topicSnippet} works in practice: imagine a specific situation where this concept applies directly, with concrete details that make the abstract idea clear and memorable.`,
-  };
-}
-
-function buildCardsFromText(text, style) {
-  const chunks = chunkText(text);
-  return chunks.map((c, i) => buildCard(c, style, i, chunks.length));
-}
-
-// --- Real AI generation via the PHP/Gemini backend --------------------------
-// Sends chunked text to api/tutor.php, which calls Gemini with the key kept
-// server-side. Falls back to the local generator above if the request fails,
-// so a demo never breaks on stage from a network or quota issue.
-
-async function fetchCardsFromBackend(chunks, style) {
-  const response = await fetch(API_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chunks, style }),
-  });
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}));
-    throw new Error(errorData.error || `Backend request failed: ${response.status}`);
+async function fetchCards(payload, style) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 90000);
+  let response;
+  try {
+    response = await fetch(API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...payload, style }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    throw new Error(
+      err.name === "AbortError"
+        ? "The server took too long to answer. Please try again."
+        : "Couldn't reach the server. Check your connection and try again."
+    );
+  } finally {
+    clearTimeout(timeout);
   }
-  const data = await response.json();
-  if (!data.cards || !Array.isArray(data.cards)) throw new Error("Malformed backend response");
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.error || `Something went wrong (error ${response.status}). Please try again.`);
+  }
+  if (!Array.isArray(data.cards) || data.cards.length === 0) {
+    throw new Error("The AI returned an empty answer. Please try again.");
+  }
   return data.cards.map((c, i) => ({
     index: i,
     total: data.cards.length,
@@ -162,16 +150,16 @@ async function fetchCardsFromBackend(chunks, style) {
   }));
 }
 
-async function generateCards(text, style) {
+// A typed topic: Gemini breaks it into several cards that build on each other.
+function generateTopicCards(topic, style) {
+  return fetchCards({ mode: "topic", topic: topic.trim() }, style);
+}
+
+// PDF text: split into passages, one card per passage.
+function generatePassageCards(text, style) {
   const chunks = chunkText(text);
-  if (chunks.length === 0) return [];
-  try {
-    return await fetchCardsFromBackend(chunks, style);
-  } catch (err) {
-    console.warn("Falling back to local card generation:", err.message);
-    // Return locally generated cards as fallback
-    return chunks.map((c, i) => buildCard(c, style, i, chunks.length));
-  }
+  if (chunks.length === 0) return Promise.resolve([]);
+  return fetchCards({ mode: "passages", chunks }, style);
 }
 
 async function extractPdfText(file) {
@@ -196,7 +184,7 @@ function Radar({ profile }) {
   };
   const poly = keys.map((k, i) => point(i, profile[k]).join(",")).join(" ");
   return (
-    <svg viewBox="0 0 180 180" style={{ width: "100%", maxWidth: 200 }}>
+    <svg viewBox="-16 0 212 180" style={{ width: "100%", maxWidth: 200 }}>
       {[0.33, 0.66, 1].map((f, i) => (
         <polygon
           key={i}
@@ -245,7 +233,23 @@ export default function App() {
   const [pdfError, setPdfError] = useState("");
   const [loadingSource, setLoadingSource] = useState(null); // null | 'topic' | 'pdf'
   const [cardsError, setCardsError] = useState("");
+  const [slowServer, setSlowServer] = useState(false);
   const fileInputRef = useRef(null);
+
+  // Wake the backend when the app first loads.
+  useEffect(() => {
+    wakeBackend();
+  }, []);
+
+  // If a request is taking a while, explain why instead of looking frozen.
+  useEffect(() => {
+    if (!loadingSource) {
+      setSlowServer(false);
+      return;
+    }
+    const timer = setTimeout(() => setSlowServer(true), 6000);
+    return () => clearTimeout(timer);
+  }, [loadingSource]);
 
   const profile = useMemo(() => scoreToProfile(scores), [scores]);
   const style = overrideStyle || (Object.values(scores).some((v) => v > 0) ? dominantStyle(profile) : "visual");
@@ -261,17 +265,17 @@ export default function App() {
   };
 
   const explainTopic = async () => {
-    if (!topic.trim()) return;
+    if (!topic.trim() || loadingSource) return;
     setLoadingSource("topic");
     setCardsError("");
     try {
-      const generated = await generateCards(topic, style);
+      const generated = await generateTopicCards(topic, style);
       setCards(generated);
       setCardIndex(0);
       setPdfName(null);
       setHistory((h) => [{ topic: topic.trim(), style }, ...h].slice(0, 6));
     } catch (err) {
-      setCardsError("Something went wrong generating cards. Please try again.");
+      setCardsError(err.message);
       console.error("Card generation error:", err);
     }
     setLoadingSource(null);
@@ -294,26 +298,36 @@ export default function App() {
       return;
     }
     setPdfLoading(true);
+    let text;
     try {
-      const text = await extractPdfText(file);
-      if (!text.trim()) {
-        setPdfError("No readable text found in that PDF.");
-        setPdfLoading(false);
-        return;
-      }
-      setLoadingSource("pdf");
-      const generated = await generateCards(text, style);
+      text = await extractPdfText(file);
+    } catch (err) {
+      setPdfError("Couldn't read that PDF. Try a different file.");
+      console.error("PDF read error:", err);
+      setPdfLoading(false);
+      return;
+    }
+    if (!text.trim()) {
+      setPdfError("No readable text found in that PDF.");
+      setPdfLoading(false);
+      return;
+    }
+    setLoadingSource("pdf");
+    try {
+      const generated = await generatePassageCards(text, style);
       setCards(generated);
       setCardIndex(0);
       setPdfName(file.name);
       setTopic("");
       setHistory((h) => [{ topic: file.name, style }, ...h].slice(0, 6));
     } catch (err) {
-      setPdfError("Couldn't read that PDF. Try a different file.");
-      console.error("PDF upload error:", err);
+      // An AI/server problem, not a problem with the PDF itself.
+      setCardsError(err.message);
+      console.error("Card generation error:", err);
     }
     setLoadingSource(null);
     setPdfLoading(false);
+    if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
   const nudgeProfile = (direction) => {
@@ -483,8 +497,10 @@ export default function App() {
         display: "flex",
         overflow: "hidden",
       }}
+      className="workspace"
     >
       <div
+        className="workspace-sidebar"
         style={{
           width: 220,
           background: "#2B3A32",
@@ -540,7 +556,7 @@ export default function App() {
         )}
       </div>
 
-      <div style={{ flex: 1, padding: "40px 44px", display: "flex", flexDirection: "column", gap: 20 }}>
+      <div className="workspace-main" style={{ flex: 1, minWidth: 0, padding: "40px 44px", display: "flex", flexDirection: "column", gap: 20 }}>
         <div style={{ display: "flex", gap: 10, maxWidth: 560, flexWrap: "wrap" }}>
           <input
             value={topic}
@@ -605,7 +621,17 @@ export default function App() {
           <p style={{ color: "#B8543E", fontSize: 13, margin: 0 }}>{pdfError}</p>
         )}
         {cardsError && (
-          <p style={{ color: "#B8543E", fontSize: 13, margin: 0 }}>{cardsError}</p>
+          <div role="alert" style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+            <p style={{ color: "#B8543E", fontSize: 13, margin: 0 }}>{cardsError}</p>
+            {topic.trim() && (
+              <button
+                onClick={explainTopic}
+                style={{ fontSize: 13, padding: "4px 12px", border: "1px solid #B8543E", background: "transparent", color: "#B8543E", borderRadius: 4, cursor: "pointer" }}
+              >
+                Try again
+              </button>
+            )}
+          </div>
         )}
         {pdfName && !pdfError && (
           <p style={{ color: "#6B7A70", fontSize: 13, margin: 0 }}>
@@ -613,14 +639,18 @@ export default function App() {
           </p>
         )}
 
-        {pdfLoading && !cards && (
+        {pdfLoading && !loadingSource && (
           <p style={{ color: "#6B7A70", fontSize: 14, maxWidth: 420 }}>
-            Reading PDF and generating cards...
+            Reading PDF...
           </p>
         )}
-        {loadingSource && !cards && !pdfLoading && (
-          <p style={{ color: "#6B7A70", fontSize: 14, maxWidth: 420 }}>
-            Generating explanation cards...
+        {loadingSource && (
+          <p role="status" style={{ color: "#6B7A70", fontSize: 14, maxWidth: 420 }}>
+            {slowServer
+              ? "Waking up the server. The free hosting sleeps when idle, so the first request can take up to a minute..."
+              : loadingSource === "pdf"
+                ? "Reading PDF and generating cards..."
+                : "Generating explanation cards..."}
           </p>
         )}
         {!cards && !pdfLoading && !loadingSource && (
@@ -795,7 +825,7 @@ function CardDeck({ cards, cardIndex, setCardIndex, theme, font, onRate, activeS
         )}
       </div>
 
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+      <div className="card-nav" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
         <button
           onClick={() => setCardIndex((i) => Math.max(0, i - 1))}
           disabled={cardIndex === 0}

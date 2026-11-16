@@ -43,6 +43,18 @@ cp config.example.php config.php
 
 Open `api/config.php` and paste in a free Gemini API key from https://ai.google.dev.
 
+In production (Render), set these environment variables instead of using `config.php`:
+
+| Variable | Example | Purpose |
+|---|---|---|
+| `GEMINI_API_KEY` | `AIza...` | Gemini key (kept server-side only) |
+| `GEMINI_MODEL` | `gemini-3.6-flash` | Model name |
+| `ALLOWED_ORIGINS` | `https://ai-tutor-rho-one.vercel.app` | Frontend URLs allowed to call the API (comma-separated) |
+
+The API rate-limits each client IP (10 requests/minute, 60/hour) and refuses
+browser requests from any site not listed in `ALLOWED_ORIGINS`, so the Gemini
+quota can't be used by other sites.
+
 3. Start the PHP backend server:
 ```bash
 cd api
